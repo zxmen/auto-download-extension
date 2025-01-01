@@ -19,13 +19,9 @@ function getAllTabs() {
 					return false;
 				}
 				
-				const isValidTab = tab.url.includes('forum.php?mod=viewthread') && 
-								 !processedTabs.includes(tab.id);
-				
-				// if (isValidTab) {
-				// 	console.log('找到符合条件的标签页:', tab);
-				// }
-				
+				// const isValidTab = tab.url.includes('forum.php?mod=viewthread') && !processedTabs.includes(tab.id);
+				const isValidTab =!processedTabs.includes(tab.id);
+				// return isValidTab;
 				return isValidTab;
 			});
 			
@@ -66,18 +62,24 @@ function processTab(tab) {
 	});
 }
 
-function clickLinkAndDownload(originalTabId) {
-	function setItem(originalTabId, pageTitle) {
+async function clickLinkAndDownload(originalTabId) {
+	function setItem(originalTabId, pageTitle, fileId) {
 		chrome.storage.local.set({
 			originalTabId: originalTabId,
-				tabTitle: pageTitle
+			tabTitle: pageTitle,
+			fileId: fileId
 		});
 	}
 
+	function splitFileId(url){
+		// 截取url中-和.htm之间的字符串
+		const fileId = url.split('-')[1].split('.htm')[0];
+		return fileId;
+	}
 	const tdElement = document.querySelector('td[id^="postmessage"]');
 	if (!tdElement) {
 		console.log('未找到帖子内容元素');
-		getAllTabs();
+		continueProcessing()
 		return;
 	}
 
@@ -86,18 +88,17 @@ function clickLinkAndDownload(originalTabId) {
 	
 	if (!pageTitle) {
 		console.log('未找到帖子标题元素');
-		getAllTabs();
+		continueProcessing()
 		return;
 	}
-
-	console.log('帖子标题:', pageTitle.innerText);
 	
 	// 尝试查找并点击下载链接
 	if (link) {
 		//修改link的href
 		link.href = link.href.replace('file-','down-').replace('pan.com','yun.com');
 		console.log('link', link);
-		setItem(originalTabId, pageTitle.innerText);
+		const fileId = splitFileId(link.href);
+		setItem(originalTabId, pageTitle.innerText, fileId);
 		link.click();
 		return;
 	}
@@ -106,27 +107,123 @@ function clickLinkAndDownload(originalTabId) {
 	const fontElements = tdElement.querySelectorAll('font');
 	for (const font of fontElements) {
 		if (font.textContent.trim().startsWith('http://www.xunniu')) {
-			setItem(originalTabId, pageTitle.innerText);
+			const fileId = splitFileId(font.textContent.trim());
+			setItem(originalTabId, pageTitle.innerText, fileId);
 			window.open(font.textContent.trim().replace('file-','down-').replace('pan.com','yun.com'), '_blank');
 			return;
 		}
 	}
 	
+	continueProcessing()
 	// 如果没找到下载链接，直接处理下一个标签页
-	getAllTabs();
+	function continueProcessing() {
+		chrome.runtime.sendMessage({ action: 'continueProcessing' });
+	}
 }
 
+	// 将下载信息上传到服务器
+	function uploadDownloadInfo(fileId,fileName,title) {
+		// 将下载信息上传到服务器
+		return new Promise((resolve, reject) => {
+			fetch('http://localhost:3000/xnFile/create', {
+				method: 'POST',
+				timeout: 2000,
+				headers: {
+					'Content-Type': 'application/json', // 设置请求头为 JSON
+					'Accept': '*/*'
+			},
+				body: JSON.stringify({ fileId,fileName,title })
+			}).then(response => response.json())
+			.then(data => {
+				if(data.code == 200){
+					resolve(true)
+				}else{
+					resolve(false)
+				}
+			})
+			.catch(error => reject(false));
+		});
+	}
 
+function updateDownloadInfo(fileId) {
+	// 将下载信息上传到服务器
+	return new Promise((resolve, reject) => {
+		fetch('http://localhost:3000/xnFile/update', {
+			method: 'POST',
+			timeout: 2000,
+			headers: {
+				'Content-Type': 'application/json', // 设置请求头为 JSON
+				'Accept': '*/*'
+		},
+			body: JSON.stringify({ fileId,status:1 })
+		}).then(response => response.json())
+		.then(data => {
+			if(data.code == 200){
+				resolve(true)
+			}else{
+				resolve(false)
+			}
+		})
+		.catch(error => reject(false));
+	});
+}
 
+chrome.downloads.onCreated.addListener(function(downloadItem) {
+	console.log('下载开始:', downloadItem);
+	// 获取下载的文件名
+	const filename = downloadItem.filename;
+	console.log('filename',filename)
+	chrome.storage.local.get(['originalTabId', 'tabTitle', 'fileId','downloadList'], async function(result) {
+		const originalTabId = parseInt(result.originalTabId, 10);
+		const tabTitle = result.tabTitle;
+		const fileId = result.fileId;
+		console.log('originalTabId',originalTabId)
+		console.log('tabTitle',tabTitle)
+		console.log('fileId',fileId)
+		if (!await uploadDownloadInfo(fileId,filename,tabTitle)) {
+			// 如果上传失败，则将这条下载信息记录下来
+			let downloadInfo = {
+				fileId: fileId,
+				filename: filename,
+				title: tabTitle,
+				status: 0
+			}
+			let downloadList = result.downloadList || {};
+			downloadList[fileId] = downloadInfo;
+			chrome.storage.local.set({ downloadList: downloadList });
+		}
+	});
+});
 
 // 监听下载完成事件
-chrome.downloads.onChanged.addListener(function(downloadDelta) {
-	console.log(downloadDelta);
+chrome.downloads.onChanged.addListener(async function(downloadDelta) {
+	console.log('downloadDelta',downloadDelta)
 	if (downloadDelta.state && downloadDelta.state.current === 'complete') {
-		chrome.storage.local.get(['originalTabId', 'tabTitle'], function(result) {
+		chrome.storage.local.get(['originalTabId', 'tabTitle','downloadList','fileId'], async function(result) {
 			const originalTabId = parseInt(result.originalTabId, 10);
 			const tabTitle = result.tabTitle;
+			const fileId = result.fileId;
+			const downloadList = result.downloadList || {};
+			if(downloadList[fileId]){
+				// 如果下载信息已经存在，则更新下载信息
+				downloadList[fileId].status = 1;
+				chrome.storage.local.set({ downloadList: downloadList });
+			}else{
+				if(!await updateDownloadInfo(downloadDelta.id)){
+					// 如果更新失败，则将这条下载信息记录下来
+					downloadList[fileId] = {
+						fileId: fileId,
+						filename: filename,
+						title: tabTitle,
+						status: 1
+					}
+					chrome.storage.local.set({ downloadList: downloadList });
+				}
+			}
+			// if (!await updateDownloadInfo(downloadDelta.id)) {
+			// 	// 如果更新失败，则将这条下载信息记录下来
 
+			// }
 			// 关闭当前标签页
 			chrome.tabs.query({active: true, currentWindow: true}, function(tabs) {
 				if (tabs.length > 0) {
@@ -164,9 +261,10 @@ chrome.downloads.onChanged.addListener(function(downloadDelta) {
 chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
 	if (request.action === 'startDownload') {
 		getAllTabs();
+	} else if (request.action === 'continueProcessing') {
+		getAllTabs();
 	}
 });
-
 function clearProcessedTabs() {
 	chrome.storage.local.remove('processedTabs');
 }
